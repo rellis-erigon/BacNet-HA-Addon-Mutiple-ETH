@@ -1,0 +1,12 @@
+#!/command/with-contenv bashio
+
+# ==============================================================================
+# Exit BACnet Service
+# Take down the S6 supervision tree when BACnet service stops
+# ==============================================================================
+
+bashio::log.info "BACnet service stopped"
+
+if [ "${1}" -ne 0 ] && [ "${1}" -ne 256 ]; then
+    bashio::log.warning "BACnet service exited with code ${1}"
+fi

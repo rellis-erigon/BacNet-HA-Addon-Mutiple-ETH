@@ -1,0 +1,86 @@
+# https://developers.home-assistant.io/docs/add-ons/configuration#add-on-config
+name: BACnet/IP Multi-Interface
+version: "0.1.0"
+slug: bacnetinterface
+description: >-
+  BACnet/IP interface for Home Assistant with multi-Ethernet support.
+  Discovers and communicates with BACnet devices across multiple network
+  interfaces simultaneously.
+url: "https://github.com/rellis-erigon/BacNet-HA-Addon-Mutiple-ETH"
+arch:
+  - armv7
+  - aarch64
+  - amd64
+  - i386
+init: false
+ingress: true
+ingress_entry: webapp
+host_network: true
+hassio_api: true
+homeassistant_api: true
+panel_icon: mdi:router-wireless-settings
+map:
+  - addon_config:rw
+ports:
+  80/tcp: null
+  47808/udp: 47808
+ports_description:
+  80/tcp: Default webserver port
+  47808/udp: BACnet port
+options:
+  interfaces:
+    - name: auto
+      enabled: true
+      address: auto
+      objectIdentifier: 420
+      objectName: BACnet-HA
+      foreignBBMD: "-"
+      foreignTTL: 255
+      entity_list: []
+      devices_setup:
+        - deviceID: all
+          CoV_lifetime: 600
+          CoV_list:
+            - all
+          quick_poll_rate: 5
+          quick_poll_list: []
+          slow_poll_rate: 600
+          slow_poll_list:
+            - all
+          resub_on_iam: true
+          reread_on_iam: false
+  defaultPriority: 15
+  api_accessible: false
+  loglevel: WARNING
+  segmentation: segmentedBoth
+schema:
+  interfaces:
+    - name: str
+      enabled: bool
+      address: str
+      objectIdentifier: int
+      objectName: str
+      foreignBBMD: str?
+      foreignTTL: int?
+      entity_list:
+        - str?
+      devices_setup:
+        - deviceID: str?
+          CoV_lifetime: int(60,28800)?
+          CoV_list:
+            - str?
+          quick_poll_rate: int(3,30)?
+          quick_poll_list:
+            - str?
+          slow_poll_rate: int(30,3000)?
+          slow_poll_list:
+            - str?
+          resub_on_iam: bool?
+          reread_on_iam: bool?
+  defaultPriority: int(1,16)
+  loglevel: list(DEBUG|INFO|WARNING|ERROR|CRITICAL|)
+  api_accessible: bool?
+  vendorID: int?
+  maxApduLenghtAccepted: int?
+  segmentation: list(segmentedBoth|segmentedTransmit|segmentedReceive|noSegmentation||)?
+  maxSegmentsAccepted: int?

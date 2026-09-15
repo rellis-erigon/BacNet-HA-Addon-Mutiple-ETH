@@ -1,0 +1,9 @@
+#!/command/with-contenv bashio
+
+# ==============================================================================
+# Start BACnet Multi-Interface Service
+# ==============================================================================
+
+bashio::log.info "Starting BACnet multi-interface service..."
+
+exec python3 /usr/bin/main.py

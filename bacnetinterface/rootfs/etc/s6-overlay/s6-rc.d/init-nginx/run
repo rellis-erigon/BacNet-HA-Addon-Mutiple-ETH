@@ -1,0 +1,32 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+
+# ==============================================================================
+# Initialize the NGINX service
+# s6-overlay docs: https://github.com/just-containers/s6-overlay
+# ==============================================================================
+
+bashio::log.info "Running init-nginx."
+
+ip_addresses=$(ip address show | grep 'inet ' | awk '{print $2}')
+
+ip_array=()
+
+for address in $ip_addresses
+do
+    ip_address="${address%/*}"
+    subnet_mask="${address#*/}"
+    ip_array+=("$ip_address")
+done
+
+bashio::log.info "Allowed addresses for NGINX: ${ip_array[@]}"
+
+bashio::var.json \
+    accessible "^$(bashio::config 'api_accessible')" \
+    port "$(bashio::addon.port 80)" \
+    ip_array "^$(printf '%s\n' "${ip_array[@]}" | jq -R . | jq -s .)" \
+    | tempio \
+        -template /etc/nginx/templates/ingress.gtpl \
+        -out /etc/nginx/servers/ingress.conf
+
+bashio::log.info "Generated ingress configuration successfully!"

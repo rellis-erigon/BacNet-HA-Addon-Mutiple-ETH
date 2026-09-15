@@ -1,0 +1,114 @@
+---
+configuration:
+  interfaces:
+    name: Interfaces
+    description: >-
+      List of network interfaces for BACnet/IP communication.
+      Each interface runs its own BACnet device identity.
+    items:
+      name:
+        name: Interface Name
+        description: >-
+          Network interface name (e.g. "eth0", "eth1") or "auto" to
+          use the first available Ethernet adapter.
+      enabled:
+        name: Enabled
+        description: Enable or disable this interface.
+      address:
+        name: IP Address
+        description: >-
+          IP address with CIDR prefix (e.g. "192.168.1.100/24") or "auto"
+          to use the address currently assigned to the interface.
+      objectIdentifier:
+        name: Device Object Identifier
+        description: >-
+          Unique BACnet device instance number for this interface.
+          Must be unique across all enabled interfaces.
+      objectName:
+        name: Device Object Name
+        description: >-
+          BACnet device object name for this interface.
+      foreignBBMD:
+        name: Foreign BBMD Address
+        description: >-
+          IP address of a BACnet Broadcast Management Device for foreign
+          device registration. Use "-" to disable.
+      foreignTTL:
+        name: Foreign Device TTL
+        description: >-
+          Time-to-live in seconds for foreign device registration.
+      entity_list:
+        name: Entity List
+        description: >-
+          List of Home Assistant entity IDs to expose as BACnet objects
+          on this interface.
+      devices_setup:
+        name: Device Configuration
+        description: >-
+          Per-device polling and subscription settings for BACnet devices
+          discovered on this interface.
+        items:
+          deviceID:
+            name: Device ID
+            description: >-
+              BACnet device instance number or "all" to match every device.
+          CoV_lifetime:
+            name: CoV Subscription Lifetime
+            description: >-
+              Lifetime in seconds for Change of Value subscriptions (60-28800).
+          CoV_list:
+            name: CoV Object List
+            description: >-
+              List of object identifiers for CoV subscriptions, or "all".
+          quick_poll_rate:
+            name: Quick Poll Rate
+            description: >-
+              Polling interval in seconds for quick-poll objects (3-30).
+          quick_poll_list:
+            name: Quick Poll List
+            description: >-
+              List of object identifiers for quick polling.
+          slow_poll_rate:
+            name: Slow Poll Rate
+            description: >-
+              Polling interval in seconds for slow-poll objects (30-3000).
+          slow_poll_list:
+            name: Slow Poll List
+            description: >-
+              List of object identifiers for slow polling, or "all".
+          resub_on_iam:
+            name: Resubscribe on I-Am
+            description: >-
+              Re-establish CoV subscriptions when a device sends I-Am.
+          reread_on_iam:
+            name: Re-read on I-Am
+            description: >-
+              Re-read all object properties when a device sends I-Am.
+  defaultPriority:
+    name: Default Write Priority
+    description: >-
+      Default BACnet write priority (1-16) when none is specified.
+  loglevel:
+    name: Log Level
+    description: >-
+      Logging verbosity level.
+  api_accessible:
+    name: API Accessible
+    description: >-
+      Enable external REST API access (requires auth token).
+  vendorID:
+    name: Vendor ID
+    description: >-
+      BACnet vendor identifier number.
+  segmentation:
+    name: Segmentation Support
+    description: >-
+      BACnet segmentation capability.
+  maxApduLenghtAccepted:
+    name: Max APDU Length
+    description: >-
+      Maximum APDU length accepted.
+  maxSegmentsAccepted:
+    name: Max Segments
+    description: >-
+      Maximum number of segments accepted.

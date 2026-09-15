@@ -1,0 +1,33 @@
+#!/command/with-contenv bashio
+
+# ==============================================================================
+# Initialize BACnet Multi-Interface Add-on
+# Writes auth_token.ini and ingress.ini for the Python application.
+# Interface discovery and resolution is handled by Python (interface_discovery.py).
+# ==============================================================================
+
+bashio::log.info "Initializing BACnet Multi-Interface Add-on..."
+
+# Write auth token for HA API access
+if bashio::var.has_value "$(bashio::config 'api_accessible')"; then
+    if bashio::config.true 'api_accessible'; then
+        bashio::log.info "API access enabled — writing auth token"
+        echo "$(bashio::addon.ingress_entry)" > /usr/bin/ingress.ini
+        SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
+        if [ -n "${SUPERVISOR_TOKEN}" ]; then
+            echo -n "${SUPERVISOR_TOKEN}" > /usr/bin/auth_token.ini
+        else
+            bashio::log.warning "No SUPERVISOR_TOKEN available for auth_token.ini"
+            echo -n "" > /usr/bin/auth_token.ini
+        fi
+    else
+        bashio::log.info "API access disabled"
+        echo "$(bashio::addon.ingress_entry)" > /usr/bin/ingress.ini
+        echo -n "" > /usr/bin/auth_token.ini
+    fi
+else
+    echo "$(bashio::addon.ingress_entry)" > /usr/bin/ingress.ini
+    echo -n "" > /usr/bin/auth_token.ini
+fi
+
+bashio::log.info "Init complete — interface discovery deferred to Python runtime"

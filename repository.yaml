@@ -1,0 +1,4 @@
+# https://developers.home-assistant.io/docs/add-ons/repository#repository-configuration
+name: BACnet Multi-Interface Add-on Repository
+url: 'https://github.com/rellis-erigon/BacNet-HA-Addon-Mutiple-ETH'
+maintainer: rellis-erigon
