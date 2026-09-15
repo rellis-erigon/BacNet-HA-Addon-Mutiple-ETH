@@ -1,28 +1,31 @@
-"""Main script for BACnet multi-interface add-on.
+"""Supervisor for BACnet multi-interface add-on.
 
-Phase 1: Runs a single BACnet interface using the new config schema.
-The first enabled interface from the 'interfaces' list is used.
-Phase 2 will add process-per-interface worker spawning.
+Spawns one worker process per enabled interface, each running its own
+bacpypes3 Application bound to a single network adapter. The supervisor
+runs the FastAPI web server and aggregates device data from all workers.
 """
 
 import asyncio
 import json
+import multiprocessing as mp
 import os
 import signal
+import sys
 from datetime import datetime
 from logging import Formatter, StreamHandler, getLogger
 from logging.handlers import RotatingFileHandler
 
 import uvicorn
 import webAPI
-from BACnetIOHandler import BACnetIOHandler, ObjectManager
 from bacpypes3.basetypes import Null, Segmentation, ServicesSupported
 from bacpypes3.local.device import DeviceObject
 from bacpypes3.pdu import IPv4Address
 from bacpypes3.primitivedata import ObjectIdentifier
 from const import LOGGER, subscribable_objects
 from interface_discovery import discover_and_resolve
+from ipc import CmdType, Command, DataMessage, DataType, DeviceRouter, WorkerHandle
 from webAPI import app as fastapi_app
+from worker import run_worker
 
 
 def exception_handler(loop, context):
@@ -30,135 +33,6 @@ def exception_handler(loop, context):
         LOGGER.exception(f'An uncaught error occurred: {context["exception"]}')
     except Exception:
         LOGGER.error("Tried to log error, but something went horribly wrong!!!")
-
-
-async def updater_task(app, interval, event):
-    try:
-        while True:
-            await event.wait()
-            for device_id in app.bacnet_device_dict:
-                services_supported = app.bacnet_device_dict[device_id][device_id].get(
-                    "protocolServicesSupported", ServicesSupported()
-                )
-                if services_supported["read-property-multiple"] == 1:
-                    await app.read_multiple_objects_periodically(
-                        device_identifier=device_id
-                    )
-                else:
-                    await app.read_objects_periodically(device_identifier=device_id)
-            event.clear()
-    except asyncio.CancelledError:
-        LOGGER.warning("Updater task cancelled")
-
-
-async def writer_task(app, write_queue, default_write_prio):
-    from bacpypes3.apdu import AbortPDU, ErrorPDU, RejectPDU
-
-    try:
-        while True:
-            queue_result = await write_queue.get()
-            device_id = queue_result[0]
-            object_id = queue_result[1]
-            property_id = queue_result[2]
-            property_val = queue_result[3]
-            array_index = queue_result[4]
-            priority = queue_result[5]
-
-            if not priority:
-                priority = default_write_prio
-
-            if property_val is None:
-                property_val = Null("null")
-
-            LOGGER.debug(
-                f"Writing: {device_id}, {object_id}, {property_id}, {property_val}, {priority}"
-            )
-
-            try:
-                response = await app.write_property(
-                    address=app.dev_to_addr(device_id),
-                    objid=object_id,
-                    prop=property_id,
-                    value=property_val,
-                    array_index=array_index,
-                    priority=priority,
-                )
-            except (AbortPDU, ErrorPDU, RejectPDU) as err:
-                LOGGER.error(f"response: {err}")
-                continue
-            except Exception as err:
-                LOGGER.error(f"response: {err}")
-                continue
-
-            LOGGER.info(f"response: {response if response else 'Acknowledged'}")
-
-            await asyncio.sleep(0.1)
-
-            read = await app.read_property(
-                address=app.dev_to_addr(device_id),
-                objid=object_id,
-                prop=property_id,
-                array_index=array_index,
-            )
-            LOGGER.info(f"Write result: {read}")
-
-            app.dict_updater(
-                device_identifier=device_id,
-                object_identifier=object_id,
-                property_identifier=property_id,
-                property_value=property_val,
-            )
-    except Exception as err:
-        LOGGER.error(f"Writer task error: {err}")
-    except asyncio.CancelledError:
-        LOGGER.warning("Writer task cancelled")
-
-
-async def subscribe_handler_task(app, sub_queue):
-    try:
-        while True:
-            queue_result = await sub_queue.get()
-            device_identifier = queue_result[0]
-            object_identifier = queue_result[1]
-            notifications = queue_result[2]
-            lifetime = queue_result[3]
-
-            task_name = f"{device_identifier[0].attr}:{device_identifier[1]},{object_identifier[0].attr}:{object_identifier[1]}"
-
-            for task in app.subscription_tasks:
-                if task_name in task.get_name():
-                    LOGGER.error(
-                        f"Subscription for {device_identifier}, {object_identifier} already exists"
-                    )
-                    break
-            else:
-                await app.create_subscription_task(
-                    device_identifier=device_identifier,
-                    object_identifier=object_identifier,
-                    confirmed_notifications=notifications,
-                    lifetime=lifetime,
-                )
-    except asyncio.CancelledError:
-        LOGGER.warning("Subscribe task cancelled")
-
-
-async def unsubscribe_handler_task(app, unsub_queue):
-    try:
-        while True:
-            queue_result = await unsub_queue.get()
-            device_identifier = queue_result[0]
-            object_identifier = queue_result[1]
-
-            task_name = f"{device_identifier[0].attr}:{device_identifier[1]},{object_identifier[0].attr}:{object_identifier[1]}"
-
-            for task in app.subscription_tasks:
-                if task_name in task.get_name():
-                    task.cancel()
-                    break
-            else:
-                LOGGER.error("Subscription task does not exist")
-    except asyncio.CancelledError:
-        LOGGER.warning("Unsubscribe task cancelled")
 
 
 def get_configuration():
@@ -183,15 +57,239 @@ def handler_stop_signals(signum, frame):
     LOGGER.info("Shutting down!")
 
 
+class Supervisor:
+    """Manages worker processes and aggregates their data for the web API."""
+
+    def __init__(self, resolved_interfaces, global_config, token):
+        self.resolved_interfaces = resolved_interfaces
+        self.global_config = global_config
+        self.token = token
+        self.router = DeviceRouter()
+        self.merged_device_dict = {}
+        self.worker_dicts = {}
+        self._running = True
+
+    def spawn_workers(self):
+        for iface in self.resolved_interfaces:
+            handle = WorkerHandle(
+                name=iface["name"],
+                interface_config=iface,
+            )
+
+            process = mp.Process(
+                target=run_worker,
+                args=(
+                    iface,
+                    self.global_config,
+                    handle.cmd_queue,
+                    handle.data_queue,
+                    self.token,
+                ),
+                name=f"bacnet-{iface['name']}",
+                daemon=True,
+            )
+            handle.process = process
+            self.router.register_worker(handle)
+
+            process.start()
+            handle.is_alive = True
+            LOGGER.info(f"Spawned worker for interface '{iface['name']}' (pid={process.pid})")
+
+    async def data_collector(self):
+        """Poll all worker data queues and merge device dicts."""
+        loop = asyncio.get_event_loop()
+
+        while self._running:
+            for handle in self.router.get_all_workers():
+                while True:
+                    try:
+                        msg = handle.data_queue.get_nowait()
+                    except Exception:
+                        break
+
+                    if not isinstance(msg, DataMessage):
+                        continue
+
+                    if msg.msg_type == DataType.DEVICE_DICT_UPDATE:
+                        payload = msg.payload
+                        self.worker_dicts[msg.interface_name] = payload.get("device_dict", {})
+                        device_ids = payload.get("device_ids", set())
+                        self.router.update_devices(msg.interface_name, device_ids)
+                        handle.device_ids = device_ids
+                        self._rebuild_merged_dict()
+
+                    elif msg.msg_type == DataType.STARTUP_COMPLETE:
+                        LOGGER.info(f"Worker '{msg.interface_name}' startup complete")
+
+                    elif msg.msg_type == DataType.ERROR:
+                        LOGGER.error(f"Worker '{msg.interface_name}' error: {msg.payload}")
+
+            self._check_worker_health()
+            await asyncio.sleep(0.25)
+
+    def _rebuild_merged_dict(self):
+        merged = {}
+        for iface_name, device_dict in self.worker_dicts.items():
+            for device_id, device_data in device_dict.items():
+                if device_id in merged:
+                    merged[device_id].update(device_data)
+                else:
+                    merged[device_id] = dict(device_data)
+        self.merged_device_dict = merged
+        webAPI.bacnet_device_dict = self.merged_device_dict
+        webAPI.events.val_updated_event.set()
+
+    def _check_worker_health(self):
+        for handle in self.router.get_all_workers():
+            if handle.process and not handle.process.is_alive() and handle.is_alive:
+                LOGGER.error(
+                    f"Worker '{handle.name}' died (exit code {handle.process.exitcode})"
+                )
+                handle.is_alive = False
+
+    def route_write(self, device_id_str, object_id, property_id, value, array_index, priority):
+        handle = self.router.get_worker_for_device(device_id_str)
+        if not handle:
+            LOGGER.warning(f"No worker owns device {device_id_str}, broadcasting write")
+            self.router.broadcast(Command(
+                cmd_type=CmdType.WRITE_PROPERTY,
+                payload={
+                    "device_id": ObjectIdentifier(device_id_str),
+                    "object_id": object_id,
+                    "property_id": property_id,
+                    "value": value,
+                    "array_index": array_index,
+                    "priority": priority,
+                },
+            ))
+            return
+
+        handle.cmd_queue.put(Command(
+            cmd_type=CmdType.WRITE_PROPERTY,
+            payload={
+                "device_id": ObjectIdentifier(device_id_str),
+                "object_id": object_id,
+                "property_id": property_id,
+                "value": value,
+                "array_index": array_index,
+                "priority": priority,
+            },
+        ))
+
+    def route_subscribe(self, device_id, object_id, confirmed, lifetime):
+        device_id_str = f"{device_id[0].attr}:{device_id[1]}"
+        handle = self.router.get_worker_for_device(device_id_str)
+        if not handle:
+            LOGGER.warning(f"No worker owns device {device_id_str}, broadcasting subscribe")
+            self.router.broadcast(Command(
+                cmd_type=CmdType.SUBSCRIBE,
+                payload={
+                    "device_id": device_id,
+                    "object_id": object_id,
+                    "confirmed": confirmed,
+                    "lifetime": lifetime,
+                },
+            ))
+            return
+
+        handle.cmd_queue.put(Command(
+            cmd_type=CmdType.SUBSCRIBE,
+            payload={
+                "device_id": device_id,
+                "object_id": object_id,
+                "confirmed": confirmed,
+                "lifetime": lifetime,
+            },
+        ))
+
+    def route_unsubscribe(self, device_id, object_id):
+        device_id_str = f"{device_id[0].attr}:{device_id[1]}"
+        handle = self.router.get_worker_for_device(device_id_str)
+        if handle:
+            handle.cmd_queue.put(Command(
+                cmd_type=CmdType.UNSUBSCRIBE,
+                payload={"device_id": device_id, "object_id": object_id},
+            ))
+        else:
+            self.router.broadcast(Command(
+                cmd_type=CmdType.UNSUBSCRIBE,
+                payload={"device_id": device_id, "object_id": object_id},
+            ))
+
+    def broadcast_who_is(self):
+        self.router.broadcast(Command(cmd_type=CmdType.WHO_IS))
+
+    def broadcast_i_am(self):
+        self.router.broadcast(Command(cmd_type=CmdType.I_AM))
+
+    def broadcast_read_all(self):
+        self.router.broadcast(Command(cmd_type=CmdType.READ_ALL))
+
+    def shutdown_workers(self):
+        self._running = False
+        self.router.broadcast(Command(cmd_type=CmdType.SHUTDOWN))
+        for handle in self.router.get_all_workers():
+            if handle.process and handle.process.is_alive():
+                handle.process.join(timeout=5)
+                if handle.process.is_alive():
+                    LOGGER.warning(f"Force-killing worker '{handle.name}'")
+                    handle.process.terminate()
+
+
+async def write_forwarder(supervisor, write_queue, default_write_prio):
+    """Reads from the webAPI write queue and routes to the correct worker."""
+    try:
+        while True:
+            queue_result = await write_queue.get()
+            device_id = queue_result[0]
+            object_id = queue_result[1]
+            property_id = queue_result[2]
+            property_val = queue_result[3]
+            array_index = queue_result[4]
+            priority = queue_result[5]
+
+            if not priority:
+                priority = default_write_prio
+
+            device_id_str = f"{device_id[0].attr}:{device_id[1]}"
+            supervisor.route_write(
+                device_id_str, object_id, property_id, property_val, array_index, priority
+            )
+    except asyncio.CancelledError:
+        LOGGER.warning("Write forwarder cancelled")
+
+
+async def subscribe_forwarder(supervisor, sub_queue):
+    """Reads from the webAPI subscribe queue and routes to the correct worker."""
+    try:
+        while True:
+            queue_result = await sub_queue.get()
+            device_identifier = queue_result[0]
+            object_identifier = queue_result[1]
+            notifications = queue_result[2]
+            lifetime = queue_result[3]
+            supervisor.route_subscribe(device_identifier, object_identifier, notifications, lifetime)
+    except asyncio.CancelledError:
+        LOGGER.warning("Subscribe forwarder cancelled")
+
+
+async def unsubscribe_forwarder(supervisor, unsub_queue):
+    """Reads from the webAPI unsubscribe queue and routes to the correct worker."""
+    try:
+        while True:
+            queue_result = await unsub_queue.get()
+            device_identifier = queue_result[0]
+            object_identifier = queue_result[1]
+            supervisor.route_unsubscribe(device_identifier, object_identifier)
+    except asyncio.CancelledError:
+        LOGGER.warning("Unsubscribe forwarder cancelled")
+
+
 async def main():
     options, token = get_configuration()
 
     loglevel = options.get("loglevel", "INFO")
     default_write_prio = options.get("defaultPriority", 15)
-    vendor_id = options.get("vendorID", 15)
-    segmentation_supported = options.get("segmentation", "segmentedBoth")
-    max_apdu = options.get("maxApduLenghtAccepted", 1476)
-    max_segments = options.get("maxSegmentsAccepted", 64)
 
     formatter = Formatter(
         "[%(asctime)-8s]|%(levelname)-8s |%(filename)-18s->%(funcName)-36s: %(message)s",
@@ -217,99 +315,63 @@ async def main():
 
     LOGGER.setLevel("DEBUG")
 
-    # Discover and resolve interfaces
     resolved_interfaces = discover_and_resolve(options)
 
     if not resolved_interfaces:
         LOGGER.error("No interfaces available — cannot start BACnet stack")
         return
 
-    # Phase 1: use the first resolved interface
-    iface = resolved_interfaces[0]
-    if len(resolved_interfaces) > 1:
-        LOGGER.warning(
-            f"Multiple interfaces configured ({len(resolved_interfaces)}), "
-            f"but Phase 1 only supports one. Using '{iface['name']}' ({iface['cidr']}). "
-            f"Multi-interface support coming in Phase 2."
-        )
-
-    ipv4_address = IPv4Address(iface["cidr"])
-    object_identifier = iface["objectIdentifier"]
-    object_name = iface["objectName"]
-    foreign_ip = iface.get("foreignBBMD")
-    foreign_ttl = iface.get("foreignTTL", 255)
-    devices_setup = iface.get("devices_setup", [])
-    entity_list = iface.get("entity_list", [])
+    global_config = {
+        "vendorID": options.get("vendorID", 15),
+        "segmentation": options.get("segmentation", "segmentedBoth"),
+        "maxApduLenghtAccepted": options.get("maxApduLenghtAccepted", 1476),
+        "maxSegmentsAccepted": options.get("maxSegmentsAccepted", 64),
+        "defaultPriority": default_write_prio,
+        "loglevel": loglevel,
+    }
 
     LOGGER.info(
-        f"Starting on interface '{iface['name']}': "
-        f"ID={object_identifier}, Name={object_name}, IP={ipv4_address}, "
-        f"max_apdu={max_apdu}, segments={max_segments}, "
-        f"segmentation={segmentation_supported}, foreign_ip={foreign_ip}"
+        f"Starting supervisor with {len(resolved_interfaces)} interface(s): "
+        f"{[r['name'] + '=' + r['cidr'] for r in resolved_interfaces]}"
     )
 
-    this_device = DeviceObject(
-        objectIdentifier=ObjectIdentifier(f"device,{object_identifier}"),
-        objectName=object_name,
-        description=f"BACnet Multi-Interface Add-on [{iface['name']}]",
-        vendorIdentifier=int(vendor_id),
-        segmentationSupported=Segmentation(segmentation_supported),
-        maxApduLengthAccepted=int(max_apdu),
-        maxSegmentsAccepted=int(max_segments),
+    supervisor = Supervisor(resolved_interfaces, global_config, token)
+    supervisor.spawn_workers()
+
+    webAPI.bacnet_device_dict = supervisor.merged_device_dict
+
+    async def who_is_wrapper():
+        supervisor.broadcast_who_is()
+        return True
+
+    def i_am_wrapper():
+        supervisor.broadcast_i_am()
+
+    webAPI.who_is_func = who_is_wrapper
+    webAPI.i_am_func = i_am_wrapper
+
+    webAPI.events.startup_complete_event.set()
+
+    collector_task = asyncio.create_task(supervisor.data_collector())
+
+    write_fwd_task = asyncio.create_task(
+        write_forwarder(supervisor, webAPI.events.write_queue, default_write_prio)
+    )
+    sub_fwd_task = asyncio.create_task(
+        subscribe_forwarder(supervisor, webAPI.events.sub_queue)
+    )
+    unsub_fwd_task = asyncio.create_task(
+        unsubscribe_forwarder(supervisor, webAPI.events.unsub_queue)
     )
 
-    if foreign_ip == "-":
-        foreign_ip = None
+    def _on_read_all():
+        supervisor.broadcast_read_all()
 
-    app = BACnetIOHandler(
-        device=this_device,
-        local_ip=ipv4_address,
-        foreign_ip=foreign_ip,
-        ttl=int(foreign_ttl),
-        update_event=webAPI.events.val_updated_event,
-        addon_device_config=devices_setup,
-    )
-
-    object_manager = ObjectManager(
-        app=app, entity_list=entity_list if entity_list else None, api_token=token
-    )
-
-    app.asap.maxApduLengthAccepted = int(max_apdu)
-    app.asap.segmentationSupported = Segmentation(segmentation_supported)
-    app.asap.maxSegmentsAccepted = int(max_segments)
-    app.asap.apduTimeout = int(5000)
-    app.subscription_list = subscribable_objects
-
-    update_task = asyncio.create_task(
-        updater_task(
-            app=app,
-            interval=int(500),
-            event=webAPI.events.read_event,
-        )
-    )
-
-    write_task = asyncio.create_task(
-        writer_task(
-            app=app,
-            write_queue=webAPI.events.write_queue,
-            default_write_prio=default_write_prio,
-        )
-    )
-
-    sub_task = asyncio.create_task(
-        subscribe_handler_task(app=app, sub_queue=webAPI.events.sub_queue)
-    )
-
-    unsub_task = asyncio.create_task(
-        unsubscribe_handler_task(app=app, unsub_queue=webAPI.events.unsub_queue)
-    )
-
-    webAPI.sub_list = app.subscription_tasks
-    webAPI.bacnet_device_dict = app.bacnet_device_dict
-    webAPI.bacnet_application = app
-    webAPI.who_is_func = app.who_is
-    webAPI.i_am_func = app.i_am
-    webAPI.events.startup_complete_event = app.startup_complete
+    original_read_event_set = webAPI.events.read_event.set
+    def patched_read_event_set():
+        original_read_event_set()
+        _on_read_all()
+    webAPI.events.read_event.set = patched_read_event_set
 
     if loglevel == "DEBUG":
         uvilog = "info"
@@ -327,16 +389,14 @@ async def main():
 
     await server.serve()
 
-    if app:
-        app.bacnet_device_sqlite.commit()
-        app.bacnet_device_sqlite.close()
-        update_task.cancel()
-        write_task.cancel()
-        sub_task.cancel()
-        unsub_task.cancel()
-        await app.end_subscription_tasks()
-        app.close()
+    LOGGER.info("Supervisor shutting down — stopping workers")
+    supervisor.shutdown_workers()
+    collector_task.cancel()
+    write_fwd_task.cancel()
+    sub_fwd_task.cancel()
+    unsub_fwd_task.cancel()
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     asyncio.run(main())

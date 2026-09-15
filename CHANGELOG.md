@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.2.0] - 2026-09-15
+
+### Added
+- Process-per-interface worker architecture (`worker.py`)
+- IPC module (`ipc.py`) with typed Command/DataMessage protocol and DeviceRouter
+- Supervisor in `main.py` that spawns workers and aggregates device data
+- Write/subscribe/unsubscribe request routing from web API to correct worker
+- Worker health monitoring with dead-process detection
+- Automatic device-to-worker mapping for targeted command routing
+- Broadcast fallback when device ownership is unknown
+
+### Changed
+- `main.py` rewritten from single-interface runner to multi-process supervisor
+- Web API write/subscribe/read-all commands now forwarded through IPC to workers
+- Device dict merging across all worker processes for unified API responses
+
+### Notes
+- Phase 2 (Worker Isolation): Each enabled interface now runs in its own process
+  with a dedicated bacpypes3 Application — no UDP port 47808 conflicts
+- Phase 3 will add device merging/namespacing and a unified subscription view
+
 ## [0.1.0] - 2026-09-15
 
 ### Added
