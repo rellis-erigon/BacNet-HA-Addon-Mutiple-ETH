@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.3.0] - 2026-09-15
+
+### Added
+- `SupervisorProxy` class that mimics BACnetIOHandler interface for webAPI v2 endpoints
+- Request-response IPC pattern with `request_id` and `asyncio.Future` matching
+- New IPC commands: `READ_PROPERTY`, `TIME_SYNC`, `UTC_TIME_SYNC`, `GET_SUBSCRIPTIONS`
+- `COMMAND_RESPONSE` data type for worker → supervisor replies
+- Subscription state syncing from workers to supervisor (periodic + on-demand)
+- `/apiv2/interfaces` endpoint — lists all interfaces with status, device count, config
+- `/apiv2/interfaces/{name}` endpoint — detailed interface info with devices and subscriptions
+- `/apiv2/interfaces/{name}/devices` endpoint — per-interface device listing
+- `get_interface_status()` method on DeviceRouter for API consumption
+
+### Changed
+- webAPI v2 endpoints (read/write property, time sync, CoV subscribe/unsubscribe)
+  now route through IPC to workers instead of calling bacpypes3 directly
+- `ipc.py` extended with request-response protocol and new command types
+- `worker.py` handles all new command types with response-aware error handling
+- Workers periodically report subscription state to supervisor
+- `webAPI.py` gains `supervisor_ref` global for interface status endpoints
+
+### Notes
+- Phase 3 (Device Merging & Proxy): Full API compatibility with multi-process
+  architecture — all v1 and v2 endpoints work across multiple interfaces
+- Phase 4 will add UI enhancements and documentation
+
 ## [0.2.0] - 2026-09-15
 
 ### Added

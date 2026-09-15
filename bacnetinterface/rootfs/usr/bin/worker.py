@@ -9,11 +9,8 @@ import asyncio
 import json
 import logging
 import multiprocessing as mp
-import signal
 import traceback
 from logging import Formatter, StreamHandler
-from logging.handlers import RotatingFileHandler
-from math import e
 
 from bacpypes3.basetypes import Null, Segmentation, ServicesSupported
 from bacpypes3.local.device import DeviceObject
@@ -32,7 +29,7 @@ def run_worker(
     data_queue: mp.Queue,
     token: str | None,
 ):
-    """Entry point for a worker process. Sets up logging and runs the async main."""
+    """Entry point for a worker process."""
     iface_name = interface_config.get("name", "unknown")
 
     formatter = Formatter(
@@ -140,12 +137,16 @@ async def _worker_main(
     sync_task = asyncio.create_task(
         _dict_sync_task(app, data_queue, iface_name, update_event)
     )
+    sub_sync_task = asyncio.create_task(
+        _subscription_sync_task(app, data_queue, iface_name)
+    )
 
     await shutdown_event.wait()
 
     LOGGER.info(f"Worker [{iface_name}] shutting down")
     cmd_task.cancel()
     sync_task.cancel()
+    sub_sync_task.cancel()
 
     try:
         app.bacnet_device_sqlite.commit()
@@ -165,8 +166,10 @@ async def _command_listener(
     shutdown_event: asyncio.Event,
 ):
     """Listen for commands from the supervisor and execute them."""
-    from bacpypes3.apdu import AbortPDU, ErrorPDU, RejectPDU
+    from bacpypes3.apdu import AbortPDU, ErrorPDU, ErrorRejectAbortNack, RejectPDU
     from bacpypes3.basetypes import Null
+    from bacpypes3.pdu import Address
+    from datetime import datetime
 
     loop = asyncio.get_event_loop()
 
@@ -206,10 +209,104 @@ async def _command_listener(
                         priority=priority,
                     )
                     LOGGER.info(f"Write response: {response if response else 'Acknowledged'}")
-                except (AbortPDU, ErrorPDU, RejectPDU) as err:
+
+                    if cmd.request_id:
+                        data_queue.put(DataMessage(
+                            msg_type=DataType.COMMAND_RESPONSE,
+                            interface_name=iface_name,
+                            payload={"result": "success"},
+                            request_id=cmd.request_id,
+                        ))
+                except (AbortPDU, ErrorPDU, RejectPDU, ErrorRejectAbortNack) as err:
                     LOGGER.error(f"Write error: {err}")
+                    if cmd.request_id:
+                        data_queue.put(DataMessage(
+                            msg_type=DataType.COMMAND_RESPONSE,
+                            interface_name=iface_name,
+                            payload={"error": str(err)},
+                            request_id=cmd.request_id,
+                        ))
                 except Exception as err:
                     LOGGER.error(f"Write error: {err}")
+                    if cmd.request_id:
+                        data_queue.put(DataMessage(
+                            msg_type=DataType.COMMAND_RESPONSE,
+                            interface_name=iface_name,
+                            payload={"error": str(err)},
+                            request_id=cmd.request_id,
+                        ))
+
+            elif cmd.cmd_type == CmdType.READ_PROPERTY:
+                p = cmd.payload
+                try:
+                    from fastapi.encoders import jsonable_encoder
+                    address = app.dev_to_addr(p["device_id"])
+                    result = await app.read_property(
+                        address, p["object_id"], p["property_id"], p.get("array_index")
+                    )
+                    data_queue.put(DataMessage(
+                        msg_type=DataType.COMMAND_RESPONSE,
+                        interface_name=iface_name,
+                        payload={"result": jsonable_encoder(result)},
+                        request_id=cmd.request_id,
+                    ))
+                except Exception as err:
+                    data_queue.put(DataMessage(
+                        msg_type=DataType.COMMAND_RESPONSE,
+                        interface_name=iface_name,
+                        payload={"error": str(err)},
+                        request_id=cmd.request_id,
+                    ))
+
+            elif cmd.cmd_type == CmdType.TIME_SYNC:
+                p = cmd.payload
+                try:
+                    device_id = p.get("device_id")
+                    dt = p.get("date_time")
+                    if device_id:
+                        app.time_sync(address=app.dev_to_addr(device_id), date_time=dt)
+                    else:
+                        app.time_sync(date_time=dt)
+                    if cmd.request_id:
+                        data_queue.put(DataMessage(
+                            msg_type=DataType.COMMAND_RESPONSE,
+                            interface_name=iface_name,
+                            payload={"result": "success"},
+                            request_id=cmd.request_id,
+                        ))
+                except Exception as err:
+                    if cmd.request_id:
+                        data_queue.put(DataMessage(
+                            msg_type=DataType.COMMAND_RESPONSE,
+                            interface_name=iface_name,
+                            payload={"error": str(err)},
+                            request_id=cmd.request_id,
+                        ))
+
+            elif cmd.cmd_type == CmdType.UTC_TIME_SYNC:
+                p = cmd.payload
+                try:
+                    device_id = p.get("device_id")
+                    dt = p.get("date_time")
+                    if device_id:
+                        app.utc_time_sync(address=app.dev_to_addr(device_id), date_time=dt)
+                    else:
+                        app.utc_time_sync(date_time=dt)
+                    if cmd.request_id:
+                        data_queue.put(DataMessage(
+                            msg_type=DataType.COMMAND_RESPONSE,
+                            interface_name=iface_name,
+                            payload={"result": "success"},
+                            request_id=cmd.request_id,
+                        ))
+                except Exception as err:
+                    if cmd.request_id:
+                        data_queue.put(DataMessage(
+                            msg_type=DataType.COMMAND_RESPONSE,
+                            interface_name=iface_name,
+                            payload={"error": str(err)},
+                            request_id=cmd.request_id,
+                        ))
 
             elif cmd.cmd_type == CmdType.SUBSCRIBE:
                 p = cmd.payload
@@ -219,6 +316,15 @@ async def _command_listener(
                     confirmed_notifications=p.get("confirmed", True),
                     lifetime=p.get("lifetime"),
                 )
+                if cmd.request_id:
+                    await asyncio.sleep(0.5)
+                    sub_info = _get_subscription_info(app, iface_name)
+                    data_queue.put(DataMessage(
+                        msg_type=DataType.COMMAND_RESPONSE,
+                        interface_name=iface_name,
+                        payload={"result": "subscribed", "subscriptions": sub_info},
+                        request_id=cmd.request_id,
+                    ))
 
             elif cmd.cmd_type == CmdType.UNSUBSCRIBE:
                 p = cmd.payload
@@ -227,6 +333,26 @@ async def _command_listener(
                     if task_name in task.get_name():
                         task.cancel()
                         break
+                if cmd.request_id:
+                    data_queue.put(DataMessage(
+                        msg_type=DataType.COMMAND_RESPONSE,
+                        interface_name=iface_name,
+                        payload={"result": "unsubscribed"},
+                        request_id=cmd.request_id,
+                    ))
+
+            elif cmd.cmd_type == CmdType.GET_SUBSCRIPTIONS:
+                sub_info = _get_subscription_info(
+                    app, iface_name,
+                    device_filter=cmd.payload.get("device_id") if cmd.payload else None,
+                    object_filter=cmd.payload.get("object_id") if cmd.payload else None,
+                )
+                data_queue.put(DataMessage(
+                    msg_type=DataType.COMMAND_RESPONSE,
+                    interface_name=iface_name,
+                    payload={"subscriptions": sub_info},
+                    request_id=cmd.request_id,
+                ))
 
             elif cmd.cmd_type == CmdType.WHO_IS:
                 await app.who_is()
@@ -246,6 +372,62 @@ async def _command_listener(
 
         except Exception as err:
             LOGGER.error(f"Command handler error ({cmd.cmd_type}): {err}")
+            if cmd.request_id:
+                data_queue.put(DataMessage(
+                    msg_type=DataType.COMMAND_RESPONSE,
+                    interface_name=iface_name,
+                    payload={"error": str(err)},
+                    request_id=cmd.request_id,
+                ))
+
+
+def _get_subscription_info(app, iface_name, device_filter=None, object_filter=None):
+    """Extract subscription task info for reporting to the supervisor."""
+    subs = []
+    for task in app.subscription_tasks:
+        try:
+            context = task.get_context()
+            items = list(context.items())
+
+            device_id = app.identifier_to_string(
+                next((v for k, v in items if k.name == "device_context"), None)
+            )
+            if device_filter and device_id != device_filter:
+                continue
+
+            object_id = app.identifier_to_string(
+                next((v for k, v in items if k.name == "object_context"), None)
+            )
+            if object_filter and object_id != object_filter:
+                continue
+
+            confirmation = next(
+                (v for k, v in items if k.name == "confirmation_context"), None
+            )
+            lifetime = next(
+                (v for k, v in items if k.name == "lifetime_context"), None
+            )
+            lifetime_remaining = next(
+                (v for k, v in items if k.name == "lifetime_remaining_context"), None
+            )
+
+            import asyncio
+            if lifetime_remaining is not None:
+                lifetime_remaining = round(
+                    max(0, lifetime_remaining - asyncio.get_event_loop().time()), 1
+                )
+
+            subs.append({
+                "interface": iface_name,
+                "device_id": device_id,
+                "object_id": object_id,
+                "confirmation": confirmation,
+                "lifetime": lifetime,
+                "lifetime_remaining": lifetime_remaining,
+            })
+        except Exception:
+            continue
+    return subs
 
 
 async def _dict_sync_task(
@@ -280,3 +462,22 @@ async def _dict_sync_task(
             await asyncio.sleep(0.5)
     except asyncio.CancelledError:
         LOGGER.debug(f"Dict sync task [{iface_name}] cancelled")
+
+
+async def _subscription_sync_task(
+    app,
+    data_queue: mp.Queue,
+    iface_name: str,
+):
+    """Periodically send subscription state to the supervisor."""
+    try:
+        while True:
+            await asyncio.sleep(5)
+            sub_info = _get_subscription_info(app, iface_name)
+            data_queue.put(DataMessage(
+                msg_type=DataType.SUBSCRIPTION_INFO,
+                interface_name=iface_name,
+                payload=sub_info,
+            ))
+    except asyncio.CancelledError:
+        LOGGER.debug(f"Subscription sync task [{iface_name}] cancelled")

@@ -4,9 +4,13 @@ Messages flow between the supervisor (main process running the web API)
 and per-interface worker processes. Each worker has its own pair of queues:
   - cmd_queue:  supervisor → worker  (commands: write, subscribe, who-is, …)
   - data_queue: worker → supervisor  (device dict snapshots, status updates)
+
+Request-response commands carry a request_id; the worker sends back a
+COMMAND_RESPONSE with the same id so the supervisor can match futures.
 """
 
 import multiprocessing as mp
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Optional
@@ -20,6 +24,10 @@ class CmdType(Enum):
     I_AM = auto()
     READ_ALL = auto()
     SHUTDOWN = auto()
+    READ_PROPERTY = auto()
+    TIME_SYNC = auto()
+    UTC_TIME_SYNC = auto()
+    GET_SUBSCRIPTIONS = auto()
 
 
 class DataType(Enum):
@@ -28,12 +36,14 @@ class DataType(Enum):
     STATUS = auto()
     ERROR = auto()
     SUBSCRIPTION_INFO = auto()
+    COMMAND_RESPONSE = auto()
 
 
 @dataclass
 class Command:
     cmd_type: CmdType
     payload: Any = None
+    request_id: str = ""
 
 
 @dataclass
@@ -41,6 +51,7 @@ class DataMessage:
     msg_type: DataType
     interface_name: str
     payload: Any = None
+    request_id: str = ""
 
 
 @dataclass
@@ -52,16 +63,12 @@ class WorkerHandle:
     data_queue: mp.Queue = field(default_factory=mp.Queue)
     interface_config: dict = field(default_factory=dict)
     device_ids: set = field(default_factory=set)
+    subscriptions: list = field(default_factory=list)
     is_alive: bool = False
 
 
 class DeviceRouter:
-    """Routes API requests to the correct worker based on device ownership.
-
-    Each worker discovers BACnet devices on its interface. The router
-    maintains a mapping of device_id → worker_name so the supervisor
-    can forward write/subscribe requests to the right worker.
-    """
+    """Routes API requests to the correct worker based on device ownership."""
 
     def __init__(self):
         self._device_to_worker: dict[str, str] = {}
@@ -92,9 +99,36 @@ class DeviceRouter:
     def get_all_workers(self) -> list[WorkerHandle]:
         return list(self._workers.values())
 
+    def get_worker(self, name: str) -> Optional[WorkerHandle]:
+        return self._workers.get(name)
+
     def broadcast(self, cmd: Command):
         for handle in self._workers.values():
             try:
                 handle.cmd_queue.put_nowait(cmd)
             except Exception:
                 pass
+
+    def get_interface_status(self) -> list[dict]:
+        """Return status of all workers for the API."""
+        result = []
+        for handle in self._workers.values():
+            result.append({
+                "name": handle.name,
+                "is_alive": handle.is_alive,
+                "device_count": len(handle.device_ids),
+                "devices": sorted(handle.device_ids),
+                "subscription_count": len(handle.subscriptions),
+                "config": {
+                    "ip": handle.interface_config.get("ip", ""),
+                    "cidr": handle.interface_config.get("cidr", ""),
+                    "objectIdentifier": handle.interface_config.get("objectIdentifier", 0),
+                    "objectName": handle.interface_config.get("objectName", ""),
+                },
+                "pid": handle.process.pid if handle.process and handle.process.is_alive() else None,
+            })
+        return result
+
+
+def new_request_id() -> str:
+    return uuid.uuid4().hex[:12]

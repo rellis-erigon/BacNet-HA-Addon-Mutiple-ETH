@@ -10,29 +10,26 @@ import json
 import multiprocessing as mp
 import os
 import signal
-import sys
 from datetime import datetime
-from logging import Formatter, StreamHandler, getLogger
+from logging import Formatter, StreamHandler
 from logging.handlers import RotatingFileHandler
 
 import uvicorn
 import webAPI
-from bacpypes3.basetypes import Null, Segmentation, ServicesSupported
-from bacpypes3.local.device import DeviceObject
-from bacpypes3.pdu import IPv4Address
 from bacpypes3.primitivedata import ObjectIdentifier
-from const import LOGGER, subscribable_objects
+from const import LOGGER
 from interface_discovery import discover_and_resolve
-from ipc import CmdType, Command, DataMessage, DataType, DeviceRouter, WorkerHandle
+from ipc import (
+    CmdType,
+    Command,
+    DataMessage,
+    DataType,
+    DeviceRouter,
+    WorkerHandle,
+    new_request_id,
+)
 from webAPI import app as fastapi_app
 from worker import run_worker
-
-
-def exception_handler(loop, context):
-    try:
-        LOGGER.exception(f'An uncaught error occurred: {context["exception"]}')
-    except Exception:
-        LOGGER.error("Tried to log error, but something went horribly wrong!!!")
 
 
 def get_configuration():
@@ -68,6 +65,7 @@ class Supervisor:
         self.merged_device_dict = {}
         self.worker_dicts = {}
         self._running = True
+        self._pending_responses: dict[str, asyncio.Future] = {}
 
     def spawn_workers(self):
         for iface in self.resolved_interfaces:
@@ -95,10 +93,26 @@ class Supervisor:
             handle.is_alive = True
             LOGGER.info(f"Spawned worker for interface '{iface['name']}' (pid={process.pid})")
 
+    async def send_and_wait(self, handle: WorkerHandle, cmd: Command, timeout: float = 10.0) -> dict:
+        """Send a command and wait for its response."""
+        req_id = new_request_id()
+        cmd.request_id = req_id
+
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        self._pending_responses[req_id] = future
+
+        handle.cmd_queue.put(cmd)
+
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            return {"error": "Request timed out"}
+        finally:
+            self._pending_responses.pop(req_id, None)
+
     async def data_collector(self):
         """Poll all worker data queues and merge device dicts."""
-        loop = asyncio.get_event_loop()
-
         while self._running:
             for handle in self.router.get_all_workers():
                 while True:
@@ -124,8 +138,16 @@ class Supervisor:
                     elif msg.msg_type == DataType.ERROR:
                         LOGGER.error(f"Worker '{msg.interface_name}' error: {msg.payload}")
 
+                    elif msg.msg_type == DataType.SUBSCRIPTION_INFO:
+                        handle.subscriptions = msg.payload or []
+
+                    elif msg.msg_type == DataType.COMMAND_RESPONSE:
+                        future = self._pending_responses.get(msg.request_id)
+                        if future and not future.done():
+                            future.set_result(msg.payload or {})
+
             self._check_worker_health()
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.1)
 
     def _rebuild_merged_dict(self):
         merged = {}
@@ -176,11 +198,98 @@ class Supervisor:
             },
         ))
 
+    async def route_read_property(self, device_id_str, object_id, property_id, array_index=None):
+        handle = self.router.get_worker_for_device(device_id_str)
+        if not handle:
+            return {"error": f"No worker owns device {device_id_str}"}
+
+        return await self.send_and_wait(handle, Command(
+            cmd_type=CmdType.READ_PROPERTY,
+            payload={
+                "device_id": ObjectIdentifier(device_id_str),
+                "object_id": object_id,
+                "property_id": property_id,
+                "array_index": array_index,
+            },
+        ))
+
+    async def route_write_v2(self, device_id, object_id, property_id, value, array_index, priority):
+        device_id_str = f"{device_id[0].attr}:{device_id[1]}"
+        handle = self.router.get_worker_for_device(device_id_str)
+        if not handle:
+            return {"error": f"No worker owns device {device_id_str}"}
+
+        return await self.send_and_wait(handle, Command(
+            cmd_type=CmdType.WRITE_PROPERTY,
+            payload={
+                "device_id": device_id,
+                "object_id": object_id,
+                "property_id": property_id,
+                "value": value,
+                "array_index": array_index,
+                "priority": priority,
+            },
+        ))
+
+    async def route_time_sync(self, device_id, date_time, utc=False):
+        cmd_type = CmdType.UTC_TIME_SYNC if utc else CmdType.TIME_SYNC
+        payload = {"date_time": date_time}
+        if device_id:
+            device_id_str = device_id if isinstance(device_id, str) else f"{device_id[0].attr}:{device_id[1]}"
+            handle = self.router.get_worker_for_device(device_id_str)
+            if handle:
+                payload["device_id"] = device_id
+                return await self.send_and_wait(handle, Command(cmd_type=cmd_type, payload=payload))
+            return {"error": f"No worker owns device {device_id_str}"}
+
+        results = []
+        for handle in self.router.get_all_workers():
+            result = await self.send_and_wait(handle, Command(cmd_type=cmd_type, payload=payload))
+            results.append(result)
+        return {"result": "success", "workers": len(results)}
+
+    async def get_subscriptions(self, device_id=None, object_id=None):
+        all_subs = []
+        for handle in self.router.get_all_workers():
+            result = await self.send_and_wait(handle, Command(
+                cmd_type=CmdType.GET_SUBSCRIPTIONS,
+                payload={"device_id": device_id, "object_id": object_id},
+            ))
+            subs = result.get("subscriptions", [])
+            all_subs.extend(subs)
+        return all_subs
+
+    async def route_subscribe_v2(self, device_id, object_id, confirmed, lifetime):
+        device_id_str = f"{device_id[0].attr}:{device_id[1]}"
+        handle = self.router.get_worker_for_device(device_id_str)
+        if not handle:
+            return {"error": f"No worker owns device {device_id_str}"}
+
+        return await self.send_and_wait(handle, Command(
+            cmd_type=CmdType.SUBSCRIBE,
+            payload={
+                "device_id": device_id,
+                "object_id": object_id,
+                "confirmed": confirmed,
+                "lifetime": lifetime,
+            },
+        ))
+
+    async def route_unsubscribe_v2(self, device_id, object_id):
+        device_id_str = f"{device_id[0].attr}:{device_id[1]}"
+        handle = self.router.get_worker_for_device(device_id_str)
+        if not handle:
+            return {"error": f"No worker owns device {device_id_str}"}
+
+        return await self.send_and_wait(handle, Command(
+            cmd_type=CmdType.UNSUBSCRIBE,
+            payload={"device_id": device_id, "object_id": object_id},
+        ))
+
     def route_subscribe(self, device_id, object_id, confirmed, lifetime):
         device_id_str = f"{device_id[0].attr}:{device_id[1]}"
         handle = self.router.get_worker_for_device(device_id_str)
         if not handle:
-            LOGGER.warning(f"No worker owns device {device_id_str}, broadcasting subscribe")
             self.router.broadcast(Command(
                 cmd_type=CmdType.SUBSCRIBE,
                 payload={
@@ -191,7 +300,6 @@ class Supervisor:
                 },
             ))
             return
-
         handle.cmd_queue.put(Command(
             cmd_type=CmdType.SUBSCRIBE,
             payload={
@@ -234,6 +342,71 @@ class Supervisor:
                 if handle.process.is_alive():
                     LOGGER.warning(f"Force-killing worker '{handle.name}'")
                     handle.process.terminate()
+
+
+class SupervisorProxy:
+    """Mimics the BACnetIOHandler interface for webAPI v2 endpoints.
+
+    Instead of calling bacpypes3 directly, routes operations through
+    the supervisor's IPC to the correct worker process.
+    """
+
+    def __init__(self, supervisor: Supervisor):
+        self._supervisor = supervisor
+        self.subscription_tasks = []
+
+    def identifier_to_string(self, ident):
+        if ident is None:
+            return None
+        if hasattr(ident, '__iter__') and len(ident) == 2:
+            return f"{ident[0].attr}:{ident[1]}" if hasattr(ident[0], 'attr') else f"{ident[0]}:{ident[1]}"
+        return str(ident)
+
+    def dev_to_addr(self, device_id):
+        return device_id
+
+    async def read_property(self, address, objid, prop, array_index=None):
+        device_id_str = str(address) if not isinstance(address, str) else address
+        if hasattr(address, '__iter__') and len(address) == 2 and hasattr(address[0], 'attr'):
+            device_id_str = f"{address[0].attr}:{address[1]}"
+        result = await self._supervisor.route_read_property(
+            device_id_str, objid, prop, array_index
+        )
+        if "error" in result:
+            raise Exception(result["error"])
+        return result.get("result")
+
+    async def write_property(self, address, objid, prop, value, array_index=None, priority=None):
+        if hasattr(address, '__iter__') and len(address) == 2 and hasattr(address[0], 'attr'):
+            device_id = address
+        else:
+            device_id = ObjectIdentifier(str(address))
+
+        result = await self._supervisor.route_write_v2(
+            device_id, objid, prop, value, array_index, priority
+        )
+        if "error" in result:
+            raise Exception(result["error"])
+        return result.get("result")
+
+    def time_sync(self, address=None, date_time=None):
+        loop = asyncio.get_event_loop()
+        asyncio.ensure_future(self._supervisor.route_time_sync(address, date_time, utc=False))
+
+    def utc_time_sync(self, address=None, date_time=None):
+        loop = asyncio.get_event_loop()
+        asyncio.ensure_future(self._supervisor.route_time_sync(address, date_time, utc=True))
+
+    @property
+    def vendor_info(self):
+        from bacpypes3.object import get_vendor_info
+        return get_vendor_info(0)
+
+    async def create_subscription_task(self, device_identifier, object_identifier,
+                                        confirmed_notifications=None, lifetime=None):
+        return await self._supervisor.route_subscribe_v2(
+            device_identifier, object_identifier, confirmed_notifications, lifetime
+        )
 
 
 async def write_forwarder(supervisor, write_queue, default_write_prio):
@@ -338,7 +511,11 @@ async def main():
     supervisor = Supervisor(resolved_interfaces, global_config, token)
     supervisor.spawn_workers()
 
+    proxy = SupervisorProxy(supervisor)
+
     webAPI.bacnet_device_dict = supervisor.merged_device_dict
+    webAPI.bacnet_application = proxy
+    webAPI.supervisor_ref = supervisor
 
     async def who_is_wrapper():
         supervisor.broadcast_who_is()
@@ -349,6 +526,7 @@ async def main():
 
     webAPI.who_is_func = who_is_wrapper
     webAPI.i_am_func = i_am_wrapper
+    webAPI.sub_list = proxy.subscription_tasks
 
     webAPI.events.startup_complete_event.set()
 

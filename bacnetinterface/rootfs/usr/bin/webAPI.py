@@ -54,6 +54,7 @@ bacnet_application: BACnetIOHandler
 activeSockets: list = []
 EDE_files: list = []
 sub_list: list = []
+supervisor_ref = None
 
 who_is_func: Callable
 i_am_func: Callable
@@ -986,3 +987,56 @@ async def write_property(
         return JSONResponse(content={"result": str(err)}, status_code=400)
 
     return JSONResponse(content=jsonable_encoder({"result": "success"}))
+
+
+@app.get("/apiv2/interfaces", tags=["apiv2"], status_code=200)
+async def get_interfaces_status():
+    """Return the status of all BACnet network interfaces."""
+    global supervisor_ref
+    if supervisor_ref is None:
+        return JSONResponse(content={"error": "Supervisor not available"}, status_code=503)
+
+    status_list = supervisor_ref.router.get_interface_status()
+    return JSONResponse(content=jsonable_encoder(status_list))
+
+
+@app.get("/apiv2/interfaces/{interface_name}", tags=["apiv2"], status_code=200)
+async def get_interface_detail(interface_name: str):
+    """Return details for a specific interface including its devices."""
+    global supervisor_ref
+    if supervisor_ref is None:
+        return JSONResponse(content={"error": "Supervisor not available"}, status_code=503)
+
+    handle = supervisor_ref.router.get_worker(interface_name)
+    if not handle:
+        return JSONResponse(content={"error": f"Interface '{interface_name}' not found"}, status_code=404)
+
+    devices = {}
+    iface_dict = supervisor_ref.worker_dicts.get(interface_name, {})
+    for device_id, device_data in iface_dict.items():
+        devices[device_id] = device_data
+
+    result = {
+        "name": handle.name,
+        "is_alive": handle.is_alive,
+        "config": handle.interface_config,
+        "device_count": len(handle.device_ids),
+        "devices": devices,
+        "subscriptions": handle.subscriptions,
+    }
+    return JSONResponse(content=jsonable_encoder(result))
+
+
+@app.get("/apiv2/interfaces/{interface_name}/devices", tags=["apiv2"], status_code=200)
+async def get_interface_devices(interface_name: str):
+    """Return devices discovered on a specific interface."""
+    global supervisor_ref
+    if supervisor_ref is None:
+        return JSONResponse(content={"error": "Supervisor not available"}, status_code=503)
+
+    handle = supervisor_ref.router.get_worker(interface_name)
+    if not handle:
+        return JSONResponse(content={"error": f"Interface '{interface_name}' not found"}, status_code=404)
+
+    iface_dict = supervisor_ref.worker_dicts.get(interface_name, {})
+    return JSONResponse(content=jsonable_encoder(iface_dict))
